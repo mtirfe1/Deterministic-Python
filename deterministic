@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+deterministic — interpreter for Deterministic Python (.dpy files)
+
+Pipeline:
+  .dpy source
+    → keyword extraction  (finds `deterministic` declarations)
+    → ast.parse()         (produces a full syntax tree)
+    → DeterministicTransformer (NodeTransformer: injects decorators + builds call graph)
+    → ast.fix_missing_locations()
+    → compile()           (byte-compiles the merged AST)
+    → exec()              (runs in an isolated namespace)
+"""
+
+import sys
+import ast
+import re
+import textwrap
+from pathlib import Path
+
+
+# ── Impurity detection ────────────────────────────────────────────────────────
+
+IMPURE_CALLS = {
+    "random", "randint", "randrange", "choice", "shuffle",  # random module
+    "time", "time_ns", "monotonic", "perf_counter",         # time module
+    "open", "read", "write", "print",                       # I/O (print allowed at top-level)
+    "input",                                                 # stdin
+}
+
+class ImpurityChecker(ast.NodeVisitor):
+    """Warn when a deterministic function body contains known impure calls."""
+
+    def __init__(self, fn_name: str):
+        self.fn_name = fn_name
+        self.warnings: list[str] = []
+
+    def visit_Call(self, node: ast.Call):
+        name = None
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+
+        if name and name in IMPURE_CALLS:
+            lineno = getattr(node, "lineno", "?")
+            self.warnings.append(
+                f"  ⚠  line {lineno}: `{name}()` may be impure — "
+                f"results in `{self.fn_name}` could be incorrectly cached"
+            )
+        self.generic_visit(node)
+
+
+# ── AST Transformer ───────────────────────────────────────────────────────────
+
+class DeterministicTransformer(ast.NodeTransformer):
+    """
+    Visits every FunctionDef whose name is in `deterministic_names` and:
+      1. Injects @_make_deterministic as the first decorator.
+      2. Tracks which deterministic functions call each other (call graph).
+      3. Runs ImpurityChecker on each body and surfaces warnings.
+    """
+
+    def __init__(self, deterministic_names: set[str]):
+        self.deterministic_names = deterministic_names
+        # caller → set of deterministic callees
+        self.call_graph: dict[str, set[str]] = {n: set() for n in deterministic_names}
+        self.warnings: list[str] = []
+        self._current_fn: str | None = None
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        if node.name not in self.deterministic_names:
+            self.generic_visit(node)
+            return node
+
+        # ── impurity check before we recurse ─────────────────────────────────
+        checker = ImpurityChecker(node.name)
+        checker.visit(node)
+        self.warnings.extend(checker.warnings)
+
+        # ── recurse so nested calls are tracked ──────────────────────────────
+        prev, self._current_fn = self._current_fn, node.name
+        self.generic_visit(node)
+        self._current_fn = prev
+
+        # ── inject decorator ─────────────────────────────────────────────────
+        decorator = ast.Name(id="_make_deterministic", ctx=ast.Load())
+        node.decorator_list.insert(0, decorator)
+        return node
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        if self._current_fn is not None and isinstance(node.func, ast.Name):
+            callee = node.func.id
+            if callee in self.deterministic_names:
+                self.call_graph[self._current_fn].add(callee)
+        self.generic_visit(node)
+        return node
+
+
+# ── Keyword extraction ────────────────────────────────────────────────────────
+
+_DET_RE = re.compile(r'^(\s*)deterministic\s+([A-Za-z_]\w*)\s*\(')
+
+def extract_deterministic_functions(source: str) -> tuple[str, set[str]]:
+    """
+    Replace `deterministic name(` → `def name(` so the source is valid Python.
+    Returns (cleaned_source, set_of_names).
+    Handles decorated lines and multi-line signatures correctly because we only
+    rewrite the specific opening line — the rest of the AST handles the body.
+    """
+    names:   set[str] = set()
+    cleaned: list[str] = []
+
+    for line in source.splitlines():
+        m = _DET_RE.match(line)
+        if m:
+            indent, name = m.group(1), m.group(2)
+            names.add(name)
+            rest = line[len(indent) + len("deterministic "):]
+            cleaned.append(f"{indent}def {rest}")
+        else:
+            cleaned.append(line)
+
+    return "\n".join(cleaned), names
+
+
+# ── Runtime source (merged into the compiled AST) ─────────────────────────────
+
+RUNTIME_SOURCE = textwrap.dedent("""\
+    import functools as _functools
+
+    def _make_deterministic(fn):
+        memo: dict = {}
+
+        @_functools.wraps(fn)
+        def wrapper(*args):
+            if args in memo:
+                print(f"{fn.__name__}({', '.join(map(str, args))}) → cache hit")
+                return memo[args]
+            print(f"{fn.__name__}({', '.join(map(str, args))}) → computing")
+            result = fn(*args)
+            memo[args] = result
+            return result
+
+        wrapper._memo   = memo
+        wrapper._fn     = fn
+        wrapper._is_det = True
+        return wrapper
+
+
+    def cache_stats():
+        \"\"\"Print a visual summary of every deterministic function's cache size.\"\"\"
+        import inspect
+        frame  = inspect.currentframe().f_back
+        fns    = [(n, r) for n, r in frame.f_globals.items()
+                  if callable(r) and getattr(r, "_is_det", False)]
+        if not fns:
+            print("(no deterministic functions in scope)")
+            return
+        width  = max(len(n) for n, _ in fns)
+        print()
+        print("┌─ cache stats " + "─" * (width + 12) + "┐")
+        for name, ref in sorted(fns):
+            bar   = "█" * min(len(ref._memo), 20)
+            count = len(ref._memo)
+            print(f"│  {name:<{width}}  {bar:<20}  {count:>4} entries │")
+        print("└" + "─" * (width + 26) + "┘")
+        print()
+""")
+
+
+# ── Visualiser ────────────────────────────────────────────────────────────────
+
+def _render_call_tree(
+    call_log: list[tuple[str, tuple, bool]],
+    fn_name:  str,
+) -> str:
+    """
+    Render a compact call-tree from the execution log for one root call.
+    call_log: list of (fn_name, args, was_cache_hit)
+    """
+    lines: list[str] = []
+    depth = 0
+    for name, args, hit in call_log:
+        if name != fn_name and depth == 0:
+            continue
+        arg_str = ", ".join(map(str, args))
+        icon    = "◎" if hit else "●"
+        indent  = "   " * depth
+        lines.append(f"{indent}{icon} {name}({arg_str})")
+        if not hit:
+            depth += 1
+        else:
+            depth = max(0, depth - 1)
+    return "\n".join(lines)
+
+
+# ── Core runner ───────────────────────────────────────────────────────────────
+
+def run_dpy(
+    filepath:    str,
+    show_ast:    bool = False,
+    show_source: bool = False,
+    show_graph:  bool = False,
+) -> None:
+    path = Path(filepath)
+    if not path.exists():
+        _die(f"File not found: {filepath}")
+    if path.suffix != ".dpy":
+        _warn(f"{filepath} does not have a .dpy extension — proceeding anyway")
+
+    raw_source = path.read_text(encoding="utf-8")
+
+    # ── 1. Extract `deterministic` declarations ───────────────────────────────
+    py_source, det_names = extract_deterministic_functions(raw_source)
+
+    if not det_names:
+        _info("No deterministic functions found — running as plain Python.")
+        exec(compile(py_source, filepath, "exec"), {"__name__": "__main__"})
+        return
+
+    _info(f"Found {len(det_names)} deterministic function(s): {', '.join(sorted(det_names))}")
+
+    # ── 2. Parse into AST ─────────────────────────────────────────────────────
+    try:
+        tree = ast.parse(py_source, filename=filepath)
+    except SyntaxError as e:
+        _die(f"Syntax error in {filepath}:\n  {e}")
+
+    # ── 3. Transform ──────────────────────────────────────────────────────────
+    transformer = DeterministicTransformer(det_names)
+    transformed = transformer.visit(tree)
+    ast.fix_missing_locations(transformed)
+
+    # ── 4. Surface impurity warnings ──────────────────────────────────────────
+    if transformer.warnings:
+        print()
+        _warn("Impurity warnings:")
+        for w in transformer.warnings:
+            print(w)
+        print()
+
+    # ── 5. Optional debug output ──────────────────────────────────────────────
+    if show_source:
+        _section("Transformed source")
+        try:
+            print(ast.unparse(transformed))
+        except AttributeError:
+            print("(ast.unparse requires Python ≥ 3.9)")
+        _end_section()
+
+    if show_ast:
+        _section("AST dump")
+        print(ast.dump(transformed, indent=2))
+        _end_section()
+
+    if show_graph:
+        non_empty = {k: v for k, v in transformer.call_graph.items() if v}
+        if non_empty:
+            _section("Call graph")
+            for caller, callees in sorted(non_empty.items()):
+                print(f"  {caller}  →  {', '.join(sorted(callees))}")
+            _end_section()
+
+    # ── 6. Merge runtime + user AST ──────────────────────────────────────────
+    runtime_tree = ast.parse(RUNTIME_SOURCE, filename="<runtime>")
+    combined     = ast.Module(
+        body         = runtime_tree.body + transformed.body,
+        type_ignores = [],
+    )
+    ast.fix_missing_locations(combined)
+
+    # ── 7. Compile + execute ──────────────────────────────────────────────────
+    code = compile(combined, filepath, "exec")
+    exec(code, {"__name__": "__main__", "__file__": str(path.resolve())})
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _info(msg: str)  -> None: print(f"\033[34m[det]\033[0m {msg}")
+def _warn(msg: str)  -> None: print(f"\033[33m[warn]\033[0m {msg}")
+def _die(msg: str)   -> None:
+    print(f"\033[31m[error]\033[0m {msg}", file=sys.stderr); sys.exit(1)
+
+def _section(title: str) -> None:
+    print(f"\n── {title} {'─' * max(0, 44 - len(title))}")
+
+def _end_section() -> None:
+    print("─" * 48 + "\n")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def _usage() -> None:
+    print(textwrap.dedent("""\
+        Usage:
+          python deterministic <file.dpy> [options]
+
+        Options:
+          --show-source   Print the transformed Python source before running
+          --show-ast      Print the full AST dump before running
+          --show-graph    Print the deterministic call graph before running
+
+        Examples:
+          python3 deterministic fib.dpy
+          python3 deterministic fib.dpy --show-source --show-graph
+    """))
+
+
+if __name__ == "__main__":
+    flags      = {a for a in sys.argv[1:] if a.startswith("--")}
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    unknown = flags - {"--show-source", "--show-ast", "--show-graph", "--help"}
+    if unknown:
+        _warn(f"Unknown flag(s): {', '.join(sorted(unknown))}")
+
+    if not positional or "--help" in flags:
+        _usage()
+        sys.exit(0 if "--help" in flags else 1)
+
+    run_dpy(
+        filepath    = positional[0],
+        show_ast    = "--show-ast"    in flags,
+        show_source = "--show-source" in flags,
+        show_graph  = "--show-graph"  in flags,
+    )

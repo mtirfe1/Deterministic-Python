@@ -1,0 +1,20 @@
+# fib.dpy
+# Classic Fibonacci — demonstrates memoization and cache hits
+
+deterministic fib(n):
+    if n <= 1:
+        return 1
+    return fib(n - 1) + fib(n - 2)
+
+print("Computing fib(0..9):")
+print("─" * 32)
+for i in range(10):
+    fib(i)
+
+print()
+print("Reading results (all from cache):")
+print("─" * 32)
+for i in range(10):
+    print(f"  fib({i}) = {fib(i)}")
+
+cache_stats()
