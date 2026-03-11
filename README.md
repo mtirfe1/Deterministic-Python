@@ -257,8 +257,4 @@ This project explores three ideas I wanted to understand deeply:
 
 It's a research-style CS project built for learning and portfolio purposes.
 
----
 
-## License
-
-MIT
