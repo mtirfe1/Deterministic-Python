@@ -255,6 +255,5 @@ This project explores three ideas I wanted to understand deeply:
 2. **Memoization at the language level** — rather than reaching for `@lru_cache`, what if the language itself could guarantee purity and handle caching transparently?
 3. **Recursion optimization** — seeing concretely how subproblem reuse collapses exponential call trees into linear ones, across both 1D and 2D DP problems.
 
-It's a research-style CS project built for learning and portfolio purposes.
 
 
